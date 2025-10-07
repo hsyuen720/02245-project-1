@@ -30,8 +30,22 @@ impl slang_ui::Hook for App {
             let cmd = &m.body.clone().unwrap().cmd;
             // Encode it in IVL
             let ivl = cmd_to_ivlcmd(cmd);
-            // Calculate obligation and error message (if obligation is not verified)
-            let (oblig, msg) = wp(&ivl, &Expr::bool(true));
+
+            let post0 = m
+                .ensures()
+                .cloned()
+                .reduce(|a, b| a & b)
+                .unwrap_or(Expr::bool(true));
+
+            let post = if let Some((_, ret_ty)) = &m.return_ty {
+                let ret_ty = ret_ty.clone();
+                let ret_expr = Expr::ident("ret", &ret_ty);
+                post0.subst_result(&ret_expr)
+                } else {
+                    post0
+                };
+
+            let (oblig, msg) = wp(&ivl, &post);
             // Convert obligation to SMT expression
             let soblig = oblig.smt(cx.smt_st())?;
 
@@ -66,6 +80,45 @@ impl slang_ui::Hook for App {
 fn cmd_to_ivlcmd(cmd: &Cmd) -> IVLCmd {
     match &cmd.kind {
         CmdKind::Assert { condition, .. } => IVLCmd::assert(condition, "Assert might fail!"),
+        CmdKind::Seq(first, second) => {
+            IVLCmd::seq(&cmd_to_ivlcmd(first), &cmd_to_ivlcmd(second))
+        },
+        CmdKind::Assume { condition } => IVLCmd::assume(condition),
+        CmdKind::Assignment { name, expr } => IVLCmd::assign(name, expr),
+        CmdKind::VarDefinition { name, ty, expr } => {
+            let ty = &ty.1;
+
+            let decl = IVLCmd::havoc(name, ty);
+
+            if let Some(init_expr) = expr {
+                let assign = IVLCmd::assign(name, init_expr);
+                IVLCmd::seq(&decl, &assign)
+            } else {
+                decl
+            }
+        },
+        CmdKind::Match { body } => {
+            let mut branches: Vec<IVLCmd> = Vec::new();
+
+            for case in &body.cases {
+                let assume  = IVLCmd::assume(&case.condition);
+                let lowered = cmd_to_ivlcmd(&case.cmd);
+                let branch  = IVLCmd::seq(&assume, &lowered);
+                branches.push(branch);
+            }
+
+            IVLCmd::nondets(&branches)
+        },
+        CmdKind::Return { expr } => {
+            match expr {
+                Some(init_expression) => {
+                    let ret_name = slang::ast::Name { ident: "ret".to_string(), span: init_expression.span };
+                    let assign: IVLCmd   = IVLCmd::assign(&ret_name, init_expression);
+                    IVLCmd::nondet(&assign, &IVLCmd::unreachable())
+                }
+                None => IVLCmd::unreachable(),
+            }
+        },
         _ => todo!("Not supported (yet)."),
     }
 }
@@ -74,7 +127,24 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> IVLCmd {
 // assertion
 fn wp(ivl: &IVLCmd, post: &Expr) -> (Expr, String) {
     match &ivl.kind {
-        IVLCmdKind::Assert { condition, message } => (condition.clone(), message.clone()),
-        _ => todo!("Not supported (yet)."),
+        IVLCmdKind::Assert { condition, message } => (condition.clone() & post.clone(), message.clone()),
+        IVLCmdKind::Seq(c1, c2, ) => {
+            let (new_post, _) = wp(c2, post);
+            wp(c1, &new_post)
+        },
+        IVLCmdKind::Assume { condition } => (!condition.clone() | post.clone(), "".to_string() ),
+        IVLCmdKind::Assignment { name, expr } => (post.clone().subst_ident(&name.ident, expr), "".to_string()),
+        IVLCmdKind::Havoc { name, ty } => {
+            let ident_name = name.as_str();
+            let ident_e = Expr::ident(&ident_name, ty);
+            let q = post.subst_ident(&name.ident, &ident_e);
+            (q, String::new())
+        }
+        IVLCmdKind::NonDet(cmd1, cmd2) => {
+            let (expr1, msg1) = wp(&cmd1, post);
+            let (expr2, msg2) = wp(&cmd2, post);
+
+            (expr1 & expr2, format!("{}{}", msg1, msg2))
+        },
     }
 }
