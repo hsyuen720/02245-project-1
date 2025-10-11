@@ -2,8 +2,15 @@ pub mod ivl;
 mod ivl_ext;
 
 use ivl::{IVLCmd, IVLCmdKind};
-use slang::ast::{Cmd, CmdKind, Expr};
+use slang::ast::{Cmd, CmdKind, Expr, Type};
 use slang_ui::prelude::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+fn fresh_ident(base: &str) -> String {
+    format!("{}_{}", base, COUNTER.fetch_add(1, Ordering::SeqCst))
+}
 
 pub struct App;
 
@@ -92,7 +99,7 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> IVLCmd {
 
             if let Some(init_expr) = expr {
                 let assign = IVLCmd::assign(name, init_expr);
-                IVLCmd::seq(&decl, &assign)
+                assign
             } else {
                 decl
             }
@@ -133,13 +140,17 @@ fn wp(ivl: &IVLCmd, post: &Expr) -> (Expr, String) {
             wp(c1, &new_post)
         },
         IVLCmdKind::Assume { condition } => (!condition.clone() | post.clone(), "".to_string() ),
-        IVLCmdKind::Assignment { name, expr } => (post.clone().subst_ident(&name.ident, expr), "".to_string()),
-        IVLCmdKind::Havoc { name, ty } => {
-            let ident_name = name.as_str();
-            let ident_e = Expr::ident(&ident_name, ty);
-            let q = post.subst_ident(&name.ident, &ident_e);
+        IVLCmdKind::Assignment { name, expr } => {
+            let q = post.clone().subst_ident(&name.ident, expr);
             (q, String::new())
         }
+
+        IVLCmdKind::Havoc { name, ty } => {
+            let fresh_name = fresh_ident(&name.ident);
+            let ident_e = Expr::ident(&fresh_name, ty);
+            let q = post.subst_ident(&name.ident, &ident_e);
+            (q, String::new())
+        },
         IVLCmdKind::NonDet(cmd1, cmd2) => {
             let (expr1, msg1) = wp(&cmd1, post);
             let (expr2, msg2) = wp(&cmd2, post);
