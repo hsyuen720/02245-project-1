@@ -172,6 +172,118 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> IVLCmd {
             // Final encoding: assert I; (assume I; check preservation); assume I ∧ ¬guards
             IVLCmd::seq(&assert_inv_init, &IVLCmd::seq(&verify_preservation, &after_loop))
         },
+        CmdKind::For { name, range, invariants, body, .. } => {
+            // Bounded for-loop: for name in range { body }
+            // For Extension Feature 1, we unroll the loop completely
+            // This allows precise verification without needing loop invariants
+            
+            // Extract start and end from range
+            let (start, end) = match range {
+                slang::ast::Range::FromTo(s, e) => (s, e),
+            };
+            
+            // Get the type of the loop variable (should be Int)
+            let ty = slang::ast::Type::Int;
+            
+            // We need to evaluate start and end to get concrete values for unrolling
+            // For now, we'll handle the common case where start and end are numeric literals
+            let start_val = match &start.kind {
+                slang::ast::ExprKind::Num(n) => *n,
+                _ => {
+                    // If start is not a literal, fall back to invariant-based encoding
+                    // Initialize loop variable: name := start
+                    let init = IVLCmd::assign(name, start);
+                    
+                    // Build the loop invariants with bounds
+                    let loop_var = Expr::ident(&name.ident, &ty);
+                    let lower_bound = loop_var.clone().ge(&start);
+                    let upper_bound = loop_var.clone().le(&end);
+                    let implicit_inv = lower_bound & upper_bound;
+                    
+                    let user_inv = invariants
+                        .iter()
+                        .cloned()
+                        .reduce(|a, b| a & b)
+                        .unwrap_or(Expr::bool(true));
+                    let inv = implicit_inv & user_inv;
+                    
+                    // Build loop body with guard and increment
+                    let guard = loop_var.clone().lt(&end);
+                    let one = Expr::new_typed(slang::ast::ExprKind::Num(1), ty.clone());
+                    let increment = IVLCmd::assign(name, &(loop_var.clone() + one));
+                    let body_encoded = cmd_to_ivlcmd(&body.cmd);
+                    let loop_body_with_increment = IVLCmd::seq(&body_encoded, &increment);
+                    let loop_case = IVLCmd::seq(&IVLCmd::assume(&guard), &loop_body_with_increment);
+                    
+                    // Standard loop encoding
+                    let assert_inv_init = IVLCmd::assert(&inv, "For-loop invariant may not hold on entry");
+                    let assume_inv_for_body = IVLCmd::assume(&inv);
+                    let assert_inv_after = IVLCmd::assert(&inv, "For-loop invariant may not be preserved");
+                    let preservation_check = IVLCmd::seq(&loop_case, &assert_inv_after);
+                    let verify_preservation = IVLCmd::seq(&assume_inv_for_body, &preservation_check);
+                    
+                    let neg_guard = !guard.clone();
+                    let after_loop = IVLCmd::seq(&IVLCmd::assume(&inv), &IVLCmd::assume(&neg_guard));
+                    
+                    let loop_encoding = IVLCmd::seq(&assert_inv_init, &IVLCmd::seq(&verify_preservation, &after_loop));
+                    return IVLCmd::seq(&init, &loop_encoding);
+                }
+            };
+            
+            let end_val = match &end.kind {
+                slang::ast::ExprKind::Num(n) => *n,
+                _ => {
+                    // Fall back to invariant-based encoding (same as above)
+                    let init = IVLCmd::assign(name, start);
+                    let loop_var = Expr::ident(&name.ident, &ty);
+                    let lower_bound = loop_var.clone().ge(&start);
+                    let upper_bound = loop_var.clone().le(&end);
+                    let implicit_inv = lower_bound & upper_bound;
+                    let user_inv = invariants.iter().cloned().reduce(|a, b| a & b).unwrap_or(Expr::bool(true));
+                    let inv = implicit_inv & user_inv;
+                    let guard = loop_var.clone().lt(&end);
+                    let one = Expr::new_typed(slang::ast::ExprKind::Num(1), ty.clone());
+                    let increment = IVLCmd::assign(name, &(loop_var.clone() + one));
+                    let body_encoded = cmd_to_ivlcmd(&body.cmd);
+                    let loop_body_with_increment = IVLCmd::seq(&body_encoded, &increment);
+                    let loop_case = IVLCmd::seq(&IVLCmd::assume(&guard), &loop_body_with_increment);
+                    let assert_inv_init = IVLCmd::assert(&inv, "For-loop invariant may not hold on entry");
+                    let assume_inv_for_body = IVLCmd::assume(&inv);
+                    let assert_inv_after = IVLCmd::assert(&inv, "For-loop invariant may not be preserved");
+                    let preservation_check = IVLCmd::seq(&loop_case, &assert_inv_after);
+                    let verify_preservation = IVLCmd::seq(&assume_inv_for_body, &preservation_check);
+                    let neg_guard = !guard.clone();
+                    let after_loop = IVLCmd::seq(&IVLCmd::assume(&inv), &IVLCmd::assume(&neg_guard));
+                    let loop_encoding = IVLCmd::seq(&assert_inv_init, &IVLCmd::seq(&verify_preservation, &after_loop));
+                    return IVLCmd::seq(&init, &loop_encoding);
+                }
+            };
+            
+            // Unroll the loop: for i = start_val; i < end_val; i++ { body }
+            let mut result = IVLCmd::nop();
+            
+            for i in start_val..end_val {
+                // Create literal expression for current iteration value
+                let i_expr = Expr::new_typed(slang::ast::ExprKind::Num(i), ty.clone());
+                
+                // Assign loop variable: name := i
+                let assign_i = IVLCmd::assign(name, &i_expr);
+                
+                // Execute body
+                let body_encoded = cmd_to_ivlcmd(&body.cmd);
+                
+                // Sequence: name := i; body
+                let iteration = IVLCmd::seq(&assign_i, &body_encoded);
+                
+                // Chain iterations together
+                result = IVLCmd::seq(&result, &iteration);
+            }
+            
+            // After all iterations, set loop variable to end_val
+            let final_expr = Expr::new_typed(slang::ast::ExprKind::Num(end_val), ty.clone());
+            let final_assign = IVLCmd::assign(name, &final_expr);
+            IVLCmd::seq(&result, &final_assign)
+        },
         _ => todo!("Not supported (yet)."),
     }
 }
