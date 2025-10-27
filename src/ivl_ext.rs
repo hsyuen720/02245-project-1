@@ -50,7 +50,7 @@ impl IVLCmd {
     }
     pub fn assert(condition: &Expr, message: &str) -> IVLCmd {
         IVLCmd {
-            span: Span::default(),
+            span: condition.span,
             kind: IVLCmdKind::Assert {
                 condition: condition.clone(),
                 message: message.to_owned(),
