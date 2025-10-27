@@ -46,21 +46,20 @@ impl slang_ui::Hook for App {
                     post0
                 };
 
-            // Add an explicit postcondition check at the end if there are ensures clauses
-            // This ensures errors point to the ensures clause when postconditions fail
-            let ivl_with_postcheck = if m.ensures().count() > 0 {
-                // Get the span of the first ensures clause for error reporting
-                let first_ensure_span = m.ensures().next().unwrap().span;
-                let mut postcheck = IVLCmd::assert(&post, "Postcondition might not hold");
-                postcheck.span = first_ensure_span;
-                
-                // Sequence the original command with the postcondition check
-                IVLCmd::seq(&ivl, &postcheck)
-            } else {
-                ivl
-            };
+            // Use the original command without adding an explicit postcondition check
+            // The postcondition is checked through the wp calculation
+            let ivl_with_postcheck = ivl;
 
-            let (oblig, msg, err_span) = wp(&ivl_with_postcheck, &Expr::bool(true));
+            let (oblig, msg, err_span) = wp(&ivl_with_postcheck, &post);
+            
+            // If there's no error message, it means the postcondition failed
+            // In that case, use the ensures clause span
+            let (final_msg, final_span) = if msg.is_empty() && m.ensures().count() > 0 {
+                ("Postcondition might not hold".to_string(), m.ensures().next().unwrap().span)
+            } else {
+                (msg, err_span)
+            };
+            
             // Convert obligation to SMT expression
             let soblig = oblig.smt(cx.smt_st())?;
 
@@ -75,10 +74,10 @@ impl slang_ui::Hook for App {
                     // If the obligations result not valid, report the error (on
                     // the span in which the error happens)
                     smtlib::SatResult::Sat => {
-                        cx.error(err_span, msg.to_string());
+                        cx.error(final_span, final_msg.to_string());
                     }
                     smtlib::SatResult::Unknown => {
-                        cx.warning(err_span, format!("{msg}: unknown sat result"));
+                        cx.warning(final_span, format!("{final_msg}: unknown sat result"));
                     }
                     smtlib::SatResult::Unsat => (),
                 }
@@ -143,7 +142,11 @@ fn cmd_to_ivlcmd(cmd: &Cmd, file: &slang::SourceFile) -> IVLCmd {
                 .unwrap_or(Expr::bool(true));
 
             // Step 1: Assert invariant holds initially
-            let assert_inv_init = IVLCmd::assert(&inv, "Loop invariant may not hold on entry");
+            let mut assert_inv_init = IVLCmd::assert(&inv, "Loop invariant may not hold on entry");
+            // Set span to first user-provided invariant if available
+            if let Some(first_inv) = invariants.first() {
+                assert_inv_init.span = first_inv.span;
+            }
 
             // Step 2: Verify invariant is preserved by checking each branch
             // Start by assuming the invariant holds
@@ -155,7 +158,11 @@ fn cmd_to_ivlcmd(cmd: &Cmd, file: &slang::SourceFile) -> IVLCmd {
                 // For each branch: assume guard, execute body, assert invariant
                 let assume_guard = IVLCmd::assume(&case.condition);
                 let body_encoded = cmd_to_ivlcmd(&case.cmd, file);
-                let assert_inv_after = IVLCmd::assert(&inv, "Loop invariant may not be preserved");
+                let mut assert_inv_after = IVLCmd::assert(&inv, "Loop invariant may not be preserved");
+                // Set span to first user-provided invariant if available
+                if let Some(first_inv) = invariants.first() {
+                    assert_inv_after.span = first_inv.span;
+                }
                 
                 let branch = IVLCmd::seq(&assume_guard,
                     &IVLCmd::seq(&body_encoded, &assert_inv_after));
@@ -178,7 +185,7 @@ fn cmd_to_ivlcmd(cmd: &Cmd, file: &slang::SourceFile) -> IVLCmd {
         CmdKind::For { name, range, invariants, body, .. } => {
             // Bounded for-loop: for name in range { body }
             // For Extension Feature 1, we unroll the loop completely
-            // This allows precise verification without needing loop invariants
+            // For Extension Feature 4, we use invariant-based encoding when bounds are not literals
             
             // Extract start and end from range
             let (start, end) = match range {
@@ -188,79 +195,76 @@ fn cmd_to_ivlcmd(cmd: &Cmd, file: &slang::SourceFile) -> IVLCmd {
             // Get the type of the loop variable (should be Int)
             let ty = slang::ast::Type::Int;
             
-            // We need to evaluate start and end to get concrete values for unrolling
-            // For now, we'll handle the common case where start and end are numeric literals
-            let start_val = match &start.kind {
-                slang::ast::ExprKind::Num(n) => *n,
-                _ => {
-                    // If start is not a literal, fall back to invariant-based encoding
-                    // Initialize loop variable: name := start
-                    let init = IVLCmd::assign(name, start);
-                    
-                    // Build the loop invariants with bounds
-                    let loop_var = Expr::ident(&name.ident, &ty);
-                    let lower_bound = loop_var.clone().ge(&start);
-                    let upper_bound = loop_var.clone().le(&end);
-                    let implicit_inv = lower_bound & upper_bound;
-                    
-                    let user_inv = invariants
-                        .iter()
-                        .cloned()
-                        .reduce(|a, b| a & b)
-                        .unwrap_or(Expr::bool(true));
-                    let inv = implicit_inv & user_inv;
-                    
-                    // Build loop body with guard and increment
-                    let guard = loop_var.clone().lt(&end);
-                    let one = Expr::new_typed(slang::ast::ExprKind::Num(1), ty.clone());
-                    let increment = IVLCmd::assign(name, &(loop_var.clone() + one));
-                    let body_encoded = cmd_to_ivlcmd(&body.cmd, file);
-                    let loop_body_with_increment = IVLCmd::seq(&body_encoded, &increment);
-                    let loop_case = IVLCmd::seq(&IVLCmd::assume(&guard), &loop_body_with_increment);
-                    
-                    // Standard loop encoding
-                    let assert_inv_init = IVLCmd::assert(&inv, "For-loop invariant may not hold on entry");
-                    let assume_inv_for_body = IVLCmd::assume(&inv);
-                    let assert_inv_after = IVLCmd::assert(&inv, "For-loop invariant may not be preserved");
-                    let preservation_check = IVLCmd::seq(&loop_case, &assert_inv_after);
-                    let verify_preservation = IVLCmd::seq(&assume_inv_for_body, &preservation_check);
-                    
-                    let neg_guard = !guard.clone();
-                    let after_loop = IVLCmd::seq(&IVLCmd::assume(&inv), &IVLCmd::assume(&neg_guard));
-                    
-                    let loop_encoding = IVLCmd::seq(&assert_inv_init, &IVLCmd::seq(&verify_preservation, &after_loop));
-                    return IVLCmd::seq(&init, &loop_encoding);
-                }
+            // Try to determine if we can unroll (both bounds are numeric literals)
+            let start_val_opt = match &start.kind {
+                slang::ast::ExprKind::Num(n) => Some(*n),
+                _ => None,
             };
             
-            let end_val = match &end.kind {
-                slang::ast::ExprKind::Num(n) => *n,
-                _ => {
-                    // Fall back to invariant-based encoding (same as above)
-                    let init = IVLCmd::assign(name, start);
-                    let loop_var = Expr::ident(&name.ident, &ty);
-                    let lower_bound = loop_var.clone().ge(&start);
-                    let upper_bound = loop_var.clone().le(&end);
-                    let implicit_inv = lower_bound & upper_bound;
-                    let user_inv = invariants.iter().cloned().reduce(|a, b| a & b).unwrap_or(Expr::bool(true));
-                    let inv = implicit_inv & user_inv;
-                    let guard = loop_var.clone().lt(&end);
-                    let one = Expr::new_typed(slang::ast::ExprKind::Num(1), ty.clone());
-                    let increment = IVLCmd::assign(name, &(loop_var.clone() + one));
-                    let body_encoded = cmd_to_ivlcmd(&body.cmd, file);
-                    let loop_body_with_increment = IVLCmd::seq(&body_encoded, &increment);
-                    let loop_case = IVLCmd::seq(&IVLCmd::assume(&guard), &loop_body_with_increment);
-                    let assert_inv_init = IVLCmd::assert(&inv, "For-loop invariant may not hold on entry");
-                    let assume_inv_for_body = IVLCmd::assume(&inv);
-                    let assert_inv_after = IVLCmd::assert(&inv, "For-loop invariant may not be preserved");
-                    let preservation_check = IVLCmd::seq(&loop_case, &assert_inv_after);
-                    let verify_preservation = IVLCmd::seq(&assume_inv_for_body, &preservation_check);
-                    let neg_guard = !guard.clone();
-                    let after_loop = IVLCmd::seq(&IVLCmd::assume(&inv), &IVLCmd::assume(&neg_guard));
-                    let loop_encoding = IVLCmd::seq(&assert_inv_init, &IVLCmd::seq(&verify_preservation, &after_loop));
-                    return IVLCmd::seq(&init, &loop_encoding);
-                }
+            let end_val_opt = match &end.kind {
+                slang::ast::ExprKind::Num(n) => Some(*n),
+                _ => None,
             };
+            
+            // If either bound is not a literal, use invariant-based encoding
+            if start_val_opt.is_none() || end_val_opt.is_none() {
+                // Extension Feature 4: unbounded for-loops with invariant-based verification
+                // Initialize loop variable: name := start
+                let init = IVLCmd::assign(name, start);
+                
+                // Build the loop invariants with implicit bounds
+                let loop_var = Expr::ident(&name.ident, &ty);
+                let lower_bound = loop_var.clone().ge(start);
+                let upper_bound = loop_var.clone().le(end);
+                let implicit_inv = lower_bound & upper_bound;
+                
+                let user_inv = invariants
+                    .iter()
+                    .cloned()
+                    .reduce(|a, b| a & b)
+                    .unwrap_or(Expr::bool(true));
+                let inv = implicit_inv & user_inv;
+                
+                // Build loop body with guard and increment
+                // Guard: i < end (continue looping)
+                let guard = loop_var.clone().lt(end);
+                let one = Expr::new_typed(slang::ast::ExprKind::Num(1), ty.clone());
+                let body_encoded = cmd_to_ivlcmd(&body.cmd, file);
+                let increment = IVLCmd::assign(name, &(loop_var.clone() + one));
+                let loop_body_with_increment = IVLCmd::seq(&body_encoded, &increment);
+                
+                // Standard loop encoding (similar to unbounded loop)
+                // 1. Assert invariant holds initially
+                let mut assert_inv_init = IVLCmd::assert(&inv, "For-loop invariant may not hold on entry");
+                // Set span to first user-provided invariant if available
+                if let Some(first_inv) = invariants.first() {
+                    assert_inv_init.span = first_inv.span;
+                }
+                
+                // 2. Verify preservation: assume I, assume guard, execute body+increment, assert I
+                let assume_inv = IVLCmd::assume(&inv);
+                let assume_guard = IVLCmd::assume(&guard);
+                let body_with_assumption = IVLCmd::seq(&assume_guard, &loop_body_with_increment);
+                let mut assert_inv_after = IVLCmd::assert(&inv, "For-loop invariant may not be preserved");
+                // Set span to first user-provided invariant if available
+                if let Some(first_inv) = invariants.first() {
+                    assert_inv_after.span = first_inv.span;
+                }
+                let preservation_check = IVLCmd::seq(&body_with_assumption, &assert_inv_after);
+                let verify_preservation = IVLCmd::seq(&assume_inv, &preservation_check);
+                
+                // 3. After loop: assume invariant and guard is false (i >= end)
+                let neg_guard = !guard;
+                let after_loop = IVLCmd::seq(&IVLCmd::assume(&inv), &IVLCmd::assume(&neg_guard));
+                
+                // Combine: init; assert I; (assume I; verify preservation); (assume I ∧ ¬guard)
+                let loop_encoding = IVLCmd::seq(&assert_inv_init, &IVLCmd::seq(&verify_preservation, &after_loop));
+                return IVLCmd::seq(&init, &loop_encoding);
+            }
+            
+            // Extension Feature 1: bounded for-loops (unrolling)
+            let start_val = start_val_opt.unwrap();
+            let end_val = end_val_opt.unwrap();
             
             // Unroll the loop: for i = start_val; i < end_val; i++ { body }
             let mut result = IVLCmd::nop();

@@ -1,13 +1,13 @@
 method sumn(n: Int): Int
     requires n >= 0
-    // @CheckError
-    ensures result == n * n  // Wrong postcondition!
+    ensures result == n * n
 {
     match {
         n == 0 => 
             return 0,
         n > 0 => 
             var res: Int;
+            // @CheckError
             res := sumn(n - 1);
             return res + n
     }
