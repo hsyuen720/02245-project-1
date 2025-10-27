@@ -1,6 +1,3 @@
-// Extension Feature 2: verification of mutually recursive methods
-// This test should pass - recursive method with correct postcondition
-
 method sumn(n: Int): Int
     requires n >= 0
     ensures result == n * (n + 1)/2
