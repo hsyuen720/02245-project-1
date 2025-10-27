@@ -30,7 +30,7 @@ impl slang_ui::Hook for App {
             // Get method's body
             let cmd = &m.body.clone().unwrap().cmd;
             // Encode it in IVL
-            let ivl = cmd_to_ivlcmd(cmd);
+            let ivl = cmd_to_ivlcmd(cmd, file);
 
             let post0 = m
                 .ensures()
@@ -46,18 +46,21 @@ impl slang_ui::Hook for App {
                     post0
                 };
 
-            // Add an explicit postcondition check at the end
-            // This ensures errors point to the ensures clause
-            let postcond_check = if m.ensures().count() > 0 {
-                let first_ensure = m.ensures().next().unwrap();
-                let mut check = IVLCmd::assert(&post, "Postcondition might not hold");
-                check.span = first_ensure.span;
-                IVLCmd::seq(&ivl, &check)
+            // Add an explicit postcondition check at the end if there are ensures clauses
+            // This ensures errors point to the ensures clause when postconditions fail
+            let ivl_with_postcheck = if m.ensures().count() > 0 {
+                // Get the span of the first ensures clause for error reporting
+                let first_ensure_span = m.ensures().next().unwrap().span;
+                let mut postcheck = IVLCmd::assert(&post, "Postcondition might not hold");
+                postcheck.span = first_ensure_span;
+                
+                // Sequence the original command with the postcondition check
+                IVLCmd::seq(&ivl, &postcheck)
             } else {
                 ivl
             };
 
-            let (oblig, msg, err_span) = wp(&postcond_check, &Expr::bool(true));
+            let (oblig, msg, err_span) = wp(&ivl_with_postcheck, &Expr::bool(true));
             // Convert obligation to SMT expression
             let soblig = oblig.smt(cx.smt_st())?;
 
@@ -89,11 +92,11 @@ impl slang_ui::Hook for App {
 
 // Encoding of (assert-only) statements into IVL (for programs comprised of only
 // a single assertion)
-fn cmd_to_ivlcmd(cmd: &Cmd) -> IVLCmd {
+fn cmd_to_ivlcmd(cmd: &Cmd, file: &slang::SourceFile) -> IVLCmd {
     match &cmd.kind {
         CmdKind::Assert { condition, .. } => IVLCmd::assert(condition, "Assert might fail!"),
         CmdKind::Seq(first, second) => {
-            IVLCmd::seq(&cmd_to_ivlcmd(first), &cmd_to_ivlcmd(second))
+            IVLCmd::seq(&cmd_to_ivlcmd(first, file), &cmd_to_ivlcmd(second, file))
         },
         CmdKind::Assume { condition } => IVLCmd::assume(condition),
         CmdKind::Assignment { name, expr } => IVLCmd::assign(name, expr),
@@ -114,7 +117,7 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> IVLCmd {
 
             for case in &body.cases {
                 let assume  = IVLCmd::assume(&case.condition);
-                let lowered = cmd_to_ivlcmd(&case.cmd);
+                let lowered = cmd_to_ivlcmd(&case.cmd, file);
                 let branch  = IVLCmd::seq(&assume, &lowered);
                 branches.push(branch);
             }
@@ -151,7 +154,7 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> IVLCmd {
             for case in &body.cases {
                 // For each branch: assume guard, execute body, assert invariant
                 let assume_guard = IVLCmd::assume(&case.condition);
-                let body_encoded = cmd_to_ivlcmd(&case.cmd);
+                let body_encoded = cmd_to_ivlcmd(&case.cmd, file);
                 let assert_inv_after = IVLCmd::assert(&inv, "Loop invariant may not be preserved");
                 
                 let branch = IVLCmd::seq(&assume_guard,
@@ -211,7 +214,7 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> IVLCmd {
                     let guard = loop_var.clone().lt(&end);
                     let one = Expr::new_typed(slang::ast::ExprKind::Num(1), ty.clone());
                     let increment = IVLCmd::assign(name, &(loop_var.clone() + one));
-                    let body_encoded = cmd_to_ivlcmd(&body.cmd);
+                    let body_encoded = cmd_to_ivlcmd(&body.cmd, file);
                     let loop_body_with_increment = IVLCmd::seq(&body_encoded, &increment);
                     let loop_case = IVLCmd::seq(&IVLCmd::assume(&guard), &loop_body_with_increment);
                     
@@ -244,7 +247,7 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> IVLCmd {
                     let guard = loop_var.clone().lt(&end);
                     let one = Expr::new_typed(slang::ast::ExprKind::Num(1), ty.clone());
                     let increment = IVLCmd::assign(name, &(loop_var.clone() + one));
-                    let body_encoded = cmd_to_ivlcmd(&body.cmd);
+                    let body_encoded = cmd_to_ivlcmd(&body.cmd, file);
                     let loop_body_with_increment = IVLCmd::seq(&body_encoded, &increment);
                     let loop_case = IVLCmd::seq(&IVLCmd::assume(&guard), &loop_body_with_increment);
                     let assert_inv_init = IVLCmd::assert(&inv, "For-loop invariant may not hold on entry");
@@ -270,7 +273,7 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> IVLCmd {
                 let assign_i = IVLCmd::assign(name, &i_expr);
                 
                 // Execute body
-                let body_encoded = cmd_to_ivlcmd(&body.cmd);
+                let body_encoded = cmd_to_ivlcmd(&body.cmd, file);
                 
                 // Sequence: name := i; body
                 let iteration = IVLCmd::seq(&assign_i, &body_encoded);
@@ -284,7 +287,102 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> IVLCmd {
             let final_assign = IVLCmd::assign(name, &final_expr);
             IVLCmd::seq(&result, &final_assign)
         },
-        _ => todo!("Not supported (yet)."),
+        CmdKind::MethodCall { name, fun_name, args, method: _ } => {
+            // Handle method calls by:
+            // 1. Assert preconditions hold (with arguments substituted)
+            // 2. Havoc return variable (if any)
+            // 3. Assume postconditions hold (with arguments and result substituted)
+            
+            // Find the called method in the source file
+            let methods = file.methods();
+            let called_method = methods
+                .iter()
+                .find(|m| m.name.ident == fun_name.ident)
+                .expect("Method not found");
+            
+            // Get parameters from the called method
+            let params: Vec<_> = called_method.args.iter().collect();
+            
+            // Build precondition checks
+            // Substitute formal parameters with actual arguments
+            let mut precond_cmd = IVLCmd::nop();
+            
+            for pre_cond in called_method.requires() {
+                let mut substituted_pre = pre_cond.clone();
+                
+                // Substitute each parameter with its corresponding argument
+                for (param, arg) in params.iter().zip(args.iter()) {
+                    substituted_pre = substituted_pre.subst_ident(&param.name.ident, arg);
+                }
+                
+                // Assert the precondition holds
+                // Use the span of the method call (fun_name) for error reporting
+                let mut assert_pre = IVLCmd::assert(&substituted_pre, "Method precondition might not hold");
+                assert_pre.span = fun_name.span;
+                precond_cmd = IVLCmd::seq(&precond_cmd, &assert_pre);
+            }
+            
+            // Handle return value if present
+            let ret_cmd = if let Some(ret_name) = name {
+                // Get return type from method signature
+                let ret_ty = if let Some((_, ty)) = &called_method.return_ty {
+                    ty.clone()
+                } else {
+                    panic!("Method call assigned to variable but method has no return type");
+                };
+                
+                // Havoc the return variable
+                let havoc_ret = IVLCmd::havoc(ret_name, &ret_ty);
+                
+                // Build postcondition assumptions
+                // Substitute formal parameters with actual arguments AND result with return variable
+                let mut postcond_cmd = havoc_ret;
+                
+                for post_cond in called_method.ensures() {
+                    let mut substituted_post = post_cond.clone();
+                    
+                    // Substitute each parameter with its corresponding argument
+                    for (param, arg) in params.iter().zip(args.iter()) {
+                        substituted_post = substituted_post.subst_ident(&param.name.ident, arg);
+                    }
+                    
+                    // Substitute 'result' with the return variable
+                    let ret_expr = Expr::ident(&ret_name.ident, &ret_ty);
+                    substituted_post = substituted_post.subst_result(&ret_expr);
+                    
+                    // Assume the postcondition holds
+                    let assume_post = IVLCmd::assume(&substituted_post);
+                    postcond_cmd = IVLCmd::seq(&postcond_cmd, &assume_post);
+                }
+                
+                postcond_cmd
+            } else {
+                // No return value - just assume postconditions
+                let mut postcond_cmd = IVLCmd::nop();
+                
+                for post_cond in called_method.ensures() {
+                    let mut substituted_post = post_cond.clone();
+                    
+                    // Substitute each parameter with its corresponding argument
+                    for (param, arg) in params.iter().zip(args.iter()) {
+                        substituted_post = substituted_post.subst_ident(&param.name.ident, arg);
+                    }
+                    
+                    // Assume the postcondition holds
+                    let assume_post = IVLCmd::assume(&substituted_post);
+                    postcond_cmd = IVLCmd::seq(&postcond_cmd, &assume_post);
+                }
+                
+                postcond_cmd
+            };
+            
+            // Sequence: assert preconditions, then havoc+assume postconditions
+            IVLCmd::seq(&precond_cmd, &ret_cmd)
+        },
+        _ => {
+            eprintln!("Unsupported command kind: {:?}", cmd.kind);
+            todo!("Not supported (yet).")
+        },
     }
 }
 
@@ -298,11 +396,12 @@ fn wp(ivl: &IVLCmd, post: &Expr) -> (Expr, String, Span) {
         IVLCmdKind::Seq(c1, c2) => {
             let (new_post, msg2, span2) = wp(c2, post);
             let (result, msg1, span1) = wp(c1, &new_post);
-            // If c1 has an error message, use it; otherwise use c2's
-            if !msg1.is_empty() {
-                (result, msg1, span1)
-            } else {
+            // Prefer c2's error message if it exists (it's later in execution)
+            // Otherwise use c1's error message
+            if !msg2.is_empty() {
                 (result, msg2, span2)
+            } else {
+                (result, msg1, span1)
             }
         },
         IVLCmdKind::Assume { condition } => {
