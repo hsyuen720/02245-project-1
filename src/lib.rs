@@ -13,6 +13,16 @@ impl slang_ui::Hook for App {
         // Get reference to Z3 solver
         let mut solver = cx.solver()?;
 
+        // Extension Feature 5: Pre-convert all domain axioms to SMT once
+        // These will be asserted as background assumptions before each check
+        let mut axiom_smts = Vec::new();
+        for domain in file.domains() {
+            for axiom in domain.axioms() {
+                let axiom_smt = axiom.expr.smt(cx.smt_st())?;
+                axiom_smts.push(axiom_smt);
+            }
+        }
+
         // Iterate methods
         for m in file.methods() {
             // Get method's preconditions;
@@ -24,8 +34,6 @@ impl slang_ui::Hook for App {
                 .unwrap_or(Expr::bool(true));
             // Convert the expression into an SMT expression
             let spre = pre.smt(cx.smt_st())?;
-            // Assert precondition
-            solver.assert(spre.as_bool()?)?;
 
             // Get method's body
             let cmd = &m.body.clone().unwrap().cmd;
@@ -67,7 +75,15 @@ impl slang_ui::Hook for App {
             // That is, after exiting the scope, all assertions are forgotten
             // from subsequent executions of the solver
             solver.scope(|solver| {
-                // Check validity of obligation
+                // Extension Feature 5: Assert domain axioms as background assumptions
+                for axiom_smt in &axiom_smts {
+                    solver.assert(axiom_smt.clone().as_bool()?)?;
+                }
+                
+                // Assert precondition inside the scope
+                solver.assert(spre.as_bool()?)?;
+                
+                // Check validity of obligation by checking if its negation is unsatisfiable
                 solver.assert(!soblig.as_bool()?)?;
                 // Run SMT solver on all current assertions
                 match solver.check_sat()? {
