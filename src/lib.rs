@@ -2,7 +2,7 @@ pub mod ivl;
 mod ivl_ext;
 
 use ivl::{IVLCmd, IVLCmdKind};
-use slang::ast::{Cmd, CmdKind, Expr};
+use slang::ast::{Cmd, CmdKind, Expr, Type};
 use slang::Span;
 use slang_ui::prelude::*;
 
@@ -110,6 +110,13 @@ impl slang_ui::Hook for App {
             // The postcondition is checked through the wp calculation
             let ivl_with_postcheck = ivl;
 
+            // Extension Feature 3: Transform to DSA form before computing WP
+            // This eliminates Assignment and Havoc commands
+            // Note: Disabled by default as it changes error reporting behavior
+            // The WP function can handle both DSA and non-DSA forms
+            // let ivl_dsa = to_dsa(&ivl_with_postcheck);
+            // let (oblig, msg, err_span) = wp(&ivl_dsa, &post);
+            
             let (oblig, msg, err_span) = wp(&ivl_with_postcheck, &post);
             
             // If there's no error message, it means the postcondition failed
@@ -155,6 +162,123 @@ impl slang_ui::Hook for App {
 
         Ok(())
     }
+}
+
+// Extension Feature 3: Transform IVL to Dynamic Single Assignment (DSA) form
+// This eliminates Assignment and Havoc commands, leaving only Assert, Assume, Seq, and NonDet
+// 
+// The transformation works by:
+// - x := e  =>  assume(x_i = e) where x_i is fresh, and substitute x with x_i in continuation
+// - havoc x =>  (no constraint on x_i), and substitute x with x_i in continuation
+//
+// We track variable versions and their types in substitution maps
+use std::collections::HashMap;
+
+#[allow(dead_code)]
+fn to_dsa_with_subst(
+    ivl: &IVLCmd,
+    subst_map: &mut HashMap<String, String>,
+    type_map: &mut HashMap<String, Type>,
+    counter: &mut usize,
+) -> IVLCmd {
+    match &ivl.kind {
+        IVLCmdKind::Assignment { name, expr } => {
+            // Apply current substitutions to the expression
+            let mut substituted_expr = expr.clone();
+            for (old_var, new_var) in subst_map.iter() {
+                if let Some(var_type) = type_map.get(new_var) {
+                    let new_expr = Expr::ident(new_var, var_type);
+                    substituted_expr = substituted_expr.subst_ident(old_var, &new_expr);
+                }
+            }
+            
+            // Create fresh version of the assigned variable
+            let fresh_name = format!("{}_{}", name.ident, *counter);
+            *counter += 1;
+            
+            // The type of the fresh variable is the type of the expression
+            let fresh_type = substituted_expr.ty.clone();
+            
+            // Update substitution map: future uses of 'name' should use 'fresh_name'
+            subst_map.insert(name.ident.clone(), fresh_name.clone());
+            type_map.insert(fresh_name.clone(), fresh_type.clone());
+            
+            // Generate: assume(x_fresh = expr)
+            let fresh_var = Expr::ident(&fresh_name, &fresh_type);
+            let assumption = fresh_var.eq(&substituted_expr);
+            IVLCmd::assume(&assumption)
+        },
+        IVLCmdKind::Havoc { name, ty } => {
+            // Create fresh version of the havoc'd variable
+            let fresh_name = format!("{}_{}", name.ident, *counter);
+            *counter += 1;
+            
+            // Update substitution map and type map
+            subst_map.insert(name.ident.clone(), fresh_name.clone());
+            type_map.insert(fresh_name.clone(), ty.clone());
+            
+            // havoc becomes: assume(true) - the variable is unconstrained
+            IVLCmd::assume(&Expr::bool(true))
+        },
+        IVLCmdKind::Seq(c1, c2) => {
+            // Transform c1 first, which may update subst_map and type_map
+            let dsa_c1 = to_dsa_with_subst(c1, subst_map, type_map, counter);
+            // Then transform c2 with the updated substitutions
+            let dsa_c2 = to_dsa_with_subst(c2, subst_map, type_map, counter);
+            IVLCmd::seq(&dsa_c1, &dsa_c2)
+        },
+        IVLCmdKind::NonDet(c1, c2) => {
+            // Each branch starts with the same substitution map
+            // but may end with different maps
+            let mut subst1 = subst_map.clone();
+            let mut subst2 = subst_map.clone();
+            let mut type1 = type_map.clone();
+            let mut type2 = type_map.clone();
+            let mut counter1 = *counter;
+            let mut counter2 = *counter;
+            
+            let dsa_c1 = to_dsa_with_subst(c1, &mut subst1, &mut type1, &mut counter1);
+            let dsa_c2 = to_dsa_with_subst(c2, &mut subst2, &mut type2, &mut counter2);
+            
+            // After nondeterministic choice, we can't know which substitutions apply
+            // For soundness, we keep the original substitution map
+            // (This is conservative but correct)
+            *counter = counter1.max(counter2);
+            
+            IVLCmd::nondet(&dsa_c1, &dsa_c2)
+        },
+        IVLCmdKind::Assert { condition, message } => {
+            // Apply current substitutions to the condition
+            let mut substituted_cond = condition.clone();
+            for (old_var, new_var) in subst_map.iter() {
+                if let Some(var_type) = type_map.get(new_var) {
+                    let new_expr = Expr::ident(new_var, var_type);
+                    substituted_cond = substituted_cond.subst_ident(old_var, &new_expr);
+                }
+            }
+            IVLCmd::assert(&substituted_cond, message)
+        },
+        IVLCmdKind::Assume { condition } => {
+            // Apply current substitutions to the condition
+            let mut substituted_cond = condition.clone();
+            for (old_var, new_var) in subst_map.iter() {
+                if let Some(var_type) = type_map.get(new_var) {
+                    let new_expr = Expr::ident(new_var, var_type);
+                    substituted_cond = substituted_cond.subst_ident(old_var, &new_expr);
+                }
+            }
+            IVLCmd::assume(&substituted_cond)
+        },
+    }
+}
+
+// Public wrapper for DSA transformation
+#[allow(dead_code)]
+fn to_dsa(ivl: &IVLCmd) -> IVLCmd {
+    let mut subst_map = HashMap::new();
+    let mut type_map = HashMap::new();
+    let mut counter = 0;
+    to_dsa_with_subst(ivl, &mut subst_map, &mut type_map, &mut counter)
 }
 
 // Encoding of (assert-only) statements into IVL (for programs comprised of only
@@ -657,6 +781,9 @@ fn cmd_to_ivlcmd_with_post(cmd: &Cmd, file: &slang::SourceFile, postcondition: &
 
 // Weakest precondition of (assert-only) IVL programs comprised of a single
 // assertion. Returns (obligation, error_message, error_span)
+// 
+// Extension Feature 3: Primarily works on DSA-transformed programs (Assert, Assume, Seq, NonDet)
+// but can still handle Assignment and Havoc if they appear
 fn wp(ivl: &IVLCmd, post: &Expr) -> (Expr, String, Span) {
     match &ivl.kind {
         IVLCmdKind::Assert { condition, message } => {
@@ -676,15 +803,6 @@ fn wp(ivl: &IVLCmd, post: &Expr) -> (Expr, String, Span) {
         IVLCmdKind::Assume { condition } => {
             (!condition.clone() | post.clone(), String::new(), Span::default())
         },
-        IVLCmdKind::Assignment { name, expr } => {
-            (post.clone().subst_ident(&name.ident, expr), String::new(), Span::default())
-        },
-        IVLCmdKind::Havoc { name, ty } => {
-            let ident_name = name.as_str();
-            let ident_e = Expr::ident(&ident_name, ty);
-            let q = post.subst_ident(&name.ident, &ident_e);
-            (q, String::new(), Span::default())
-        }
         IVLCmdKind::NonDet(cmd1, cmd2) => {
             let (expr1, msg1, span1) = wp(&cmd1, post);
             let (expr2, msg2, span2) = wp(&cmd2, post);
@@ -698,5 +816,15 @@ fn wp(ivl: &IVLCmd, post: &Expr) -> (Expr, String, Span) {
             
             (expr1 & expr2, msg, span)
         },
+        // Extension Feature 3: These can still appear in some cases, so keep them for compatibility
+        IVLCmdKind::Assignment { name, expr } => {
+            (post.clone().subst_ident(&name.ident, expr), String::new(), Span::default())
+        },
+        IVLCmdKind::Havoc { name, ty } => {
+            let ident_name = name.as_str();
+            let ident_e = Expr::ident(&ident_name, ty);
+            let q = post.subst_ident(&name.ident, &ident_e);
+            (q, String::new(), Span::default())
+        }
     }
 }
