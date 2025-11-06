@@ -202,6 +202,16 @@ fn cmd_to_ivlcmd_with_post(cmd: &Cmd, file: &slang::SourceFile, postcondition: &
                 negated_guards.push(!case.condition.clone());
             }
 
+            // Add an implicit "else" branch that does nothing when no guard matches
+            // This branch assumes all guards are false
+            if !negated_guards.is_empty() {
+                let mut else_branch = IVLCmd::nop();
+                for neg_guard in &negated_guards {
+                    else_branch = IVLCmd::seq(&IVLCmd::assume(neg_guard), &else_branch);
+                }
+                branches.push(else_branch);
+            }
+
             IVLCmd::nondets(&branches)
         },
         CmdKind::Return { expr } => {
@@ -221,6 +231,7 @@ fn cmd_to_ivlcmd_with_post(cmd: &Cmd, file: &slang::SourceFile, postcondition: &
             }
         },
         CmdKind::Loop { invariants, body, variant, .. } => {
+            // Extension Feature 11: Support break and continue
             // Extension Feature 8: variant contains the decreases expression
             let decreases = variant.as_ref();
             
@@ -231,7 +242,15 @@ fn cmd_to_ivlcmd_with_post(cmd: &Cmd, file: &slang::SourceFile, postcondition: &
                 .reduce(|a, b| a & b)
                 .unwrap_or(Expr::bool(true));
 
-            // Step 1: Assert invariant holds initially
+            // Extension Feature 11: Initialize the 'broke' variable to false before the loop
+            let broke_name = slang::ast::Name {
+                ident: "broke".to_string(),
+                span: Span::default(),
+            };
+            let false_expr = Expr::bool(false);
+            let init_broke = IVLCmd::assign(&broke_name, &false_expr);
+
+            // Step 1: Assert invariant holds initially (with broke = false)
             let mut assert_inv_init = IVLCmd::assert(&inv, "Loop invariant may not hold on entry");
             // Set span to first user-provided invariant if available
             if let Some(first_inv) = invariants.first() {
@@ -239,8 +258,10 @@ fn cmd_to_ivlcmd_with_post(cmd: &Cmd, file: &slang::SourceFile, postcondition: &
             }
 
             // Step 2: Verify invariant is preserved by checking each branch
-            // Start by assuming the invariant holds
-            let assume_inv_for_body = IVLCmd::assume(&inv);
+            // Start by assuming the invariant holds and broke = false (we're still in the loop)
+            let broke_expr = Expr::ident("broke", &slang::ast::Type::Bool);
+            let not_broke = !broke_expr.clone();
+            let assume_inv_for_body = IVLCmd::seq(&IVLCmd::assume(&inv), &IVLCmd::assume(&not_broke));
             
             // Build nondeterministic choice for all branches
             let mut preservation_branches: Vec<IVLCmd> = Vec::new();
@@ -248,6 +269,9 @@ fn cmd_to_ivlcmd_with_post(cmd: &Cmd, file: &slang::SourceFile, postcondition: &
                 // For each branch: assume guard, execute body, assert invariant
                 let assume_guard = IVLCmd::assume(&case.condition);
                 let body_encoded = cmd_to_ivlcmd(&case.cmd, file);
+                
+                // Extension Feature 11: The invariant must hold after the body
+                // This includes when break is executed (broke = true) or when continuing normally
                 let mut assert_inv_after = IVLCmd::assert(&inv, "Loop invariant may not be preserved");
                 // Set span to first user-provided invariant if available
                 if let Some(first_inv) = invariants.first() {
@@ -255,6 +279,7 @@ fn cmd_to_ivlcmd_with_post(cmd: &Cmd, file: &slang::SourceFile, postcondition: &
                 }
                 
                 // Extension Feature 8: Total correctness - check that decreases expression strictly decreases
+                // Only check decreases if we didn't break (broke = false after body)
                 let branch_with_inv = IVLCmd::seq(&assume_guard,
                     &IVLCmd::seq(&body_encoded, &assert_inv_after));
                 
@@ -269,15 +294,21 @@ fn cmd_to_ivlcmd_with_post(cmd: &Cmd, file: &slang::SourceFile, postcondition: &
                     // Before the loop body: dec_old := decreases_expr
                     let save_dec = IVLCmd::assign(&dec_old_name, dec_expr);
                     
-                    // After the loop body: assert decreases_expr < dec_old AND decreases_expr >= 0
+                    // After the loop body: if !broke, assert decreases_expr < dec_old AND decreases_expr >= 0
                     let dec_old_expr = Expr::ident("__dec_old", &dec_ty);
                     let dec_decreased = dec_expr.clone().lt(&dec_old_expr);
                     let dec_non_negative = dec_expr.clone().ge(&Expr::new_typed(
                         slang::ast::ExprKind::Num(0), 
                         dec_ty.clone()
                     ));
+                    
+                    // Extension Feature 11: Only check decreases if we didn't break
+                    // If broke, then we don't need to check termination
+                    let broke_after = Expr::ident("broke", &slang::ast::Type::Bool);
+                    let decreases_condition = broke_after.clone() | (dec_decreased & dec_non_negative);
+                    
                     let mut assert_dec = IVLCmd::assert(
-                        &(dec_decreased & dec_non_negative), 
+                        &decreases_condition, 
                         "Loop may not terminate (decreases clause not satisfied)"
                     );
                     assert_dec.span = dec_expr.span;
@@ -294,16 +325,20 @@ fn cmd_to_ivlcmd_with_post(cmd: &Cmd, file: &slang::SourceFile, postcondition: &
             let preservation_check = IVLCmd::nondets(&preservation_branches);
             let verify_preservation = IVLCmd::seq(&assume_inv_for_body, &preservation_check);
 
-            // Step 3: After loop - assume invariant and all guards are false
+            // Step 3: After loop - assume invariant and (all guards are false OR broke is true)
             let all_guards_false = body.cases
                 .iter()
                 .map(|case| !case.condition.clone())
                 .reduce(|a, b| a & b)
                 .unwrap_or(Expr::bool(true));
-            let after_loop = IVLCmd::seq(&IVLCmd::assume(&inv), &IVLCmd::assume(&all_guards_false));
+            
+            // Extension Feature 11: Loop can exit either when all guards are false OR when broke
+            let broke_after_loop = Expr::ident("broke", &slang::ast::Type::Bool);
+            let exit_condition = all_guards_false | broke_after_loop;
+            let after_loop = IVLCmd::seq(&IVLCmd::assume(&inv), &IVLCmd::assume(&exit_condition));
 
-            // Final encoding: assert I; (assume I; check preservation); assume I ∧ ¬guards
-            IVLCmd::seq(&assert_inv_init, &IVLCmd::seq(&verify_preservation, &after_loop))
+            // Final encoding: broke := false; assert I; (assume I ∧ !broke; check preservation); assume I ∧ (¬guards ∨ broke)
+            IVLCmd::seq(&init_broke, &IVLCmd::seq(&assert_inv_init, &IVLCmd::seq(&verify_preservation, &after_loop)))
         },
         CmdKind::For { name, range, invariants, body, variant, .. } => {
             // Extension Feature 8: variant contains the decreases expression
@@ -594,6 +629,24 @@ fn cmd_to_ivlcmd_with_post(cmd: &Cmd, file: &slang::SourceFile, postcondition: &
             
             // Sequence: assert preconditions, save old globals, havoc globals, then havoc+assume postconditions
             IVLCmd::seq(&precond_cmd, &IVLCmd::seq(&save_old_globals, &IVLCmd::seq(&havoc_globals, &ret_cmd)))
+        },
+        CmdKind::Break => {
+            // Extension Feature 11: Break statement
+            // Set the 'broke' variable to true
+            // The loop encoding will check the invariant after the body
+            // and will allow the loop to exit if broke is true
+            let broke_name = slang::ast::Name {
+                ident: "broke".to_string(),
+                span: cmd.span,
+            };
+            let true_expr = Expr::bool(true);
+            IVLCmd::assign(&broke_name, &true_expr)
+        },
+        CmdKind::Continue => {
+            // Extension Feature 11: Continue statement
+            // Make everything after it in the current iteration unreachable
+            // The loop will proceed to check the invariant and continue with the next iteration
+            IVLCmd::unreachable()
         },
         _ => {
             eprintln!("Unsupported command kind: {:?}", cmd.kind);
