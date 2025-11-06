@@ -4,8 +4,8 @@
 method client(): Int
 {
     var i: Int := 0;
-    loop 
-        // @CheckError
+    loop
+        // @CheckError 
         invariant i == 0
     { 
         true => 
