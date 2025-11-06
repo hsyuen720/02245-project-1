@@ -159,7 +159,10 @@ fn cmd_to_ivlcmd(cmd: &Cmd, file: &slang::SourceFile) -> IVLCmd {
                 None => IVLCmd::unreachable(),
             }
         },
-        CmdKind::Loop { invariants, body, .. } => {
+        CmdKind::Loop { invariants, body, variant, .. } => {
+            // Extension Feature 8: variant contains the decreases expression
+            let decreases = variant.as_ref();
+            
             // Merge all invariants into a single expression
             let inv = invariants
                 .iter()
@@ -190,8 +193,41 @@ fn cmd_to_ivlcmd(cmd: &Cmd, file: &slang::SourceFile) -> IVLCmd {
                     assert_inv_after.span = first_inv.span;
                 }
                 
-                let branch = IVLCmd::seq(&assume_guard,
+                // Extension Feature 8: Total correctness - check that decreases expression strictly decreases
+                let branch_with_inv = IVLCmd::seq(&assume_guard,
                     &IVLCmd::seq(&body_encoded, &assert_inv_after));
+                
+                let branch = if let Some(dec_expr) = decreases {
+                    // Create a fresh variable to store the old value of the decreases expression
+                    let dec_old_name = slang::ast::Name { 
+                        ident: "__dec_old".to_string(), 
+                        span: dec_expr.span 
+                    };
+                    let dec_ty = slang::ast::Type::Int; // decreases expressions are typically Int
+                    
+                    // Before the loop body: dec_old := decreases_expr
+                    let save_dec = IVLCmd::assign(&dec_old_name, dec_expr);
+                    
+                    // After the loop body: assert decreases_expr < dec_old AND decreases_expr >= 0
+                    let dec_old_expr = Expr::ident("__dec_old", &dec_ty);
+                    let dec_decreased = dec_expr.clone().lt(&dec_old_expr);
+                    let dec_non_negative = dec_expr.clone().ge(&Expr::new_typed(
+                        slang::ast::ExprKind::Num(0), 
+                        dec_ty.clone()
+                    ));
+                    let mut assert_dec = IVLCmd::assert(
+                        &(dec_decreased & dec_non_negative), 
+                        "Loop may not terminate (decreases clause not satisfied)"
+                    );
+                    assert_dec.span = dec_expr.span;
+                    
+                    // Sequence: save dec_old; assume guard; body; assert inv; assert decreases
+                    IVLCmd::seq(&save_dec, 
+                        &IVLCmd::seq(&branch_with_inv, &assert_dec))
+                } else {
+                    branch_with_inv
+                };
+                
                 preservation_branches.push(branch);
             }
             let preservation_check = IVLCmd::nondets(&preservation_branches);
@@ -208,7 +244,10 @@ fn cmd_to_ivlcmd(cmd: &Cmd, file: &slang::SourceFile) -> IVLCmd {
             // Final encoding: assert I; (assume I; check preservation); assume I ∧ ¬guards
             IVLCmd::seq(&assert_inv_init, &IVLCmd::seq(&verify_preservation, &after_loop))
         },
-        CmdKind::For { name, range, invariants, body, .. } => {
+        CmdKind::For { name, range, invariants, body, variant, .. } => {
+            // Extension Feature 8: variant contains the decreases expression
+            let decreases = variant.as_ref();
+            
             // Bounded for-loop: for name in range { body }
             // For Extension Feature 1, we unroll the loop completely
             // For Extension Feature 4, we use invariant-based encoding when bounds are not literals
@@ -270,7 +309,40 @@ fn cmd_to_ivlcmd(cmd: &Cmd, file: &slang::SourceFile) -> IVLCmd {
                 // 2. Verify preservation: assume I, assume guard, execute body+increment, assert I
                 let assume_inv = IVLCmd::assume(&inv);
                 let assume_guard = IVLCmd::assume(&guard);
-                let body_with_assumption = IVLCmd::seq(&assume_guard, &loop_body_with_increment);
+                
+                // Extension Feature 8: Total correctness for for-loops
+                let body_with_assumption = if let Some(dec_expr) = decreases {
+                    // Create a fresh variable to store the old value of the decreases expression
+                    let dec_old_name = slang::ast::Name { 
+                        ident: "__dec_old".to_string(), 
+                        span: dec_expr.span 
+                    };
+                    let dec_ty = slang::ast::Type::Int;
+                    
+                    // Before the loop body: dec_old := decreases_expr
+                    let save_dec = IVLCmd::assign(&dec_old_name, dec_expr);
+                    
+                    // After the loop body: assert decreases_expr < dec_old AND decreases_expr >= 0
+                    let dec_old_expr = Expr::ident("__dec_old", &dec_ty);
+                    let dec_decreased = dec_expr.clone().lt(&dec_old_expr);
+                    let dec_non_negative = dec_expr.clone().ge(&Expr::new_typed(
+                        slang::ast::ExprKind::Num(0), 
+                        dec_ty.clone()
+                    ));
+                    let mut assert_dec = IVLCmd::assert(
+                        &(dec_decreased & dec_non_negative), 
+                        "For-loop may not terminate (decreases clause not satisfied)"
+                    );
+                    assert_dec.span = dec_expr.span;
+                    
+                    // Sequence: save dec_old; assume guard; body+increment; assert decreases
+                    IVLCmd::seq(&save_dec, 
+                        &IVLCmd::seq(&assume_guard, 
+                            &IVLCmd::seq(&loop_body_with_increment, &assert_dec)))
+                } else {
+                    IVLCmd::seq(&assume_guard, &loop_body_with_increment)
+                };
+                
                 let mut assert_inv_after = IVLCmd::assert(&inv, "For-loop invariant may not be preserved");
                 // Set span to first user-provided invariant if available
                 if let Some(first_inv) = invariants.first() {
