@@ -433,8 +433,14 @@ fn cmd_to_ivlcmd_with_post(
                 branches.push(branch);
             }
 
+            // Implicit else branch: assume no guards matched, then do nothing.
+            if let Some(or_of_guards) = prev_or {
+                let else_assume = IVLCmd::assume(&!or_of_guards);
+                branches.push(IVLCmd::seq(&else_assume, &IVLCmd::nop()));
+            }
+
             IVLCmd::nondets(&branches)
-        },
+        }
         CmdKind::Return { expr } => {
             // Extension Feature 10: Early return
             // Return makes everything after it unreachable
