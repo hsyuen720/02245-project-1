@@ -1,10 +1,12 @@
 pub mod ivl;
+pub mod utils;
 mod ivl_ext;
 
 use ivl::{IVLCmd, IVLCmdKind};
 use slang::ast::{Cmd, CmdKind, Expr, Type};
 use slang::Span;
 use slang_ui::prelude::*;
+use crate::utils::next_fresh_id;
 
 pub struct App;
 
@@ -69,18 +71,47 @@ impl slang_ui::Hook for App {
             
             // Get method's preconditions;
             let pres = m.requires();
+
+
             // Merge them into a single condition
             let pre = pres
                 .cloned()
-                .reduce(|a, b| a & b)
+                .reduce(|a, b: Expr| a & b)
                 .unwrap_or(Expr::bool(true));
             // Convert the expression into an SMT expression
             let spre = pre.smt(cx.smt_st())?;
+            // Assert precondition
+            
 
             // Get method's body
             let cmd = &m.body.clone().unwrap().cmd;
-            
-            // Get the postcondition that returns should check
+            // Encode it in IVL
+            let mut ivl = cmd_to_ivlcmd(cmd, file, Some(m.as_ref()));
+
+            if let Some(v) = &m.variant {
+                // ghost to hold the entry snapshot of the variant
+                let ghost = slang::ast::Name {
+                    ident: format!("__methV_{}", m.name.ident),
+                    span: v.span,
+                };
+                let ghost_e = Expr::ident(&ghost.ident, &Type::Int);
+                let zero = Expr::new_typed(slang::ast::ExprKind::Num(0), Type::Int);
+
+                // havoc ghost; assume ghost == v; assert ghost >= 0
+                let snapshot = IVLCmd::seq(
+                    &IVLCmd::havoc(&ghost, &Type::Int),
+                    &IVLCmd::assume(&ghost_e.clone().eq(v)),
+                );
+
+                let mut nonneg_assert =
+                    IVLCmd::assert(&ghost_e.ge(&zero), "Method variant may be negative on entry");
+                // nice error location: the decreases expr itself
+                nonneg_assert.span = v.span;
+
+                // Prepend snapshot + check before the body IVL
+                ivl = IVLCmd::seq(&snapshot, &IVLCmd::seq(&nonneg_assert, &ivl));
+            }
+
             let post0 = m
                 .ensures()
                 .cloned()
@@ -96,10 +127,32 @@ impl slang_ui::Hook for App {
             };
             
             // Encode method body, passing the postcondition so returns can check it
-            let ivl_body = cmd_to_ivlcmd_with_post(cmd, file, &return_postcondition);
+            let ivl_body = cmd_to_ivlcmd_with_post(cmd, file, &return_postcondition, Some(m.as_ref()));
             
             // Prepend the save_old_globals command to the body
-            let ivl = IVLCmd::seq(&save_old_globals_cmd, &ivl_body);
+            let mut ivl = IVLCmd::seq(&save_old_globals_cmd, &ivl_body);
+
+            if let Some(v) = &m.variant {
+                let ghost = slang::ast::Name {
+                    ident: format!("__methV_{}", m.name.ident),
+                    span: v.span,
+                };
+                let ghost_e = Expr::ident(&ghost.ident, &Type::Int);
+                let zero    = Expr::new_typed(slang::ast::ExprKind::Num(0), Type::Int);
+
+                // havoc ghost; assume ghost == v; assert ghost >= 0
+                let snapshot = IVLCmd::seq(
+                    &IVLCmd::havoc(&ghost, &Type::Int),
+                    &IVLCmd::assume(&ghost_e.clone().eq(v)),
+                );
+
+                let mut nonneg_assert =
+                    IVLCmd::assert(&ghost_e.ge(&zero), "Method variant may be negative on entry");
+                nonneg_assert.span = v.span;
+
+                // Prepend snapshot + check before the body IVL we actually use
+                ivl = IVLCmd::seq(&snapshot, &IVLCmd::seq(&nonneg_assert, &ivl));
+            }
 
             // Since returns now check the postcondition, we just need to verify the body
             // with postcondition 'true' (or the actual postcondition if no returns)
@@ -320,15 +373,27 @@ fn to_dsa(ivl: &IVLCmd) -> IVLCmd {
 
 // Encoding of (assert-only) statements into IVL (for programs comprised of only
 // a single assertion)
-fn cmd_to_ivlcmd(cmd: &Cmd, file: &slang::SourceFile) -> IVLCmd {
-    cmd_to_ivlcmd_with_post(cmd, file, &Expr::bool(true))
+fn cmd_to_ivlcmd(
+    cmd: &Cmd,
+    file: &slang::SourceFile,
+    current_method: Option<&slang::ast::Method>,
+) -> IVLCmd {
+    cmd_to_ivlcmd_with_post(cmd, file, &Expr::bool(true), current_method)
 }
 
-fn cmd_to_ivlcmd_with_post(cmd: &Cmd, file: &slang::SourceFile, postcondition: &Expr) -> IVLCmd {
+fn cmd_to_ivlcmd_with_post(
+    cmd: &Cmd,
+    file: &slang::SourceFile,
+    postcondition: &Expr,
+    current_method: Option<&slang::ast::Method>,
+) -> IVLCmd {
     match &cmd.kind {
         CmdKind::Assert { condition, .. } => IVLCmd::assert(condition, "Assert might fail!"),
         CmdKind::Seq(first, second) => {
-            IVLCmd::seq(&cmd_to_ivlcmd_with_post(first, file, postcondition), &cmd_to_ivlcmd_with_post(second, file, postcondition))
+            IVLCmd::seq(
+                &cmd_to_ivlcmd_with_post(first, file, postcondition, current_method),
+                &cmd_to_ivlcmd_with_post(second, file, postcondition, current_method),
+            )
         },
         CmdKind::Assume { condition } => IVLCmd::assume(condition),
         CmdKind::Assignment { name, expr } => IVLCmd::assign(name, expr),
@@ -346,35 +411,36 @@ fn cmd_to_ivlcmd_with_post(cmd: &Cmd, file: &slang::SourceFile, postcondition: &
         },
         CmdKind::Match { body } => {
             let mut branches: Vec<IVLCmd> = Vec::new();
-            let mut negated_guards: Vec<Expr> = Vec::new();
+
+            // running disjunction of previous guards
+            let mut prev_or: Option<Expr> = None;
 
             for case in &body.cases {
-                // Each branch assumes its own guard AND the negation of all previous guards
-                let mut branch_assumptions = IVLCmd::assume(&case.condition);
-                for neg_guard in &negated_guards {
-                    branch_assumptions = IVLCmd::seq(&IVLCmd::assume(neg_guard), &branch_assumptions);
-                }
-                
-                let lowered = cmd_to_ivlcmd_with_post(&case.cmd, file, postcondition);
-                let branch  = IVLCmd::seq(&branch_assumptions, &lowered);
+                // guard' = guard ∧ ¬(∨ previous guards)
+                let guard = case.condition.clone();
+                let guard_prime = if let Some(prev) = &prev_or {
+                    guard.clone() & !prev.clone()
+                } else {
+                    guard.clone()
+                };
+
+                // update prev_or := prev_or ∨ guard
+                prev_or = Some(if let Some(prev) = prev_or { prev | guard } else { guard });
+
+                let assume = IVLCmd::assume(&guard_prime);
+                let lowered = cmd_to_ivlcmd_with_post(&case.cmd, file, postcondition, current_method);
+                let branch = IVLCmd::seq(&assume, &lowered);
                 branches.push(branch);
-                
-                // Add negation of current guard to the list for subsequent branches
-                negated_guards.push(!case.condition.clone());
             }
 
-            // Add an implicit "else" branch that does nothing when no guard matches
-            // This branch assumes all guards are false
-            if !negated_guards.is_empty() {
-                let mut else_branch = IVLCmd::nop();
-                for neg_guard in &negated_guards {
-                    else_branch = IVLCmd::seq(&IVLCmd::assume(neg_guard), &else_branch);
-                }
-                branches.push(else_branch);
+            // Implicit else branch: assume no guards matched, then do nothing.
+            if let Some(or_of_guards) = prev_or {
+                let else_assume = IVLCmd::assume(&!or_of_guards);
+                branches.push(IVLCmd::seq(&else_assume, &IVLCmd::nop()));
             }
 
             IVLCmd::nondets(&branches)
-        },
+        }
         CmdKind::Return { expr } => {
             // Extension Feature 10: Early return
             // Return makes everything after it unreachable
@@ -429,10 +495,8 @@ fn cmd_to_ivlcmd_with_post(cmd: &Cmd, file: &slang::SourceFile, postcondition: &
             for case in &body.cases {
                 // For each branch: assume guard, execute body, assert invariant
                 let assume_guard = IVLCmd::assume(&case.condition);
-                let body_encoded = cmd_to_ivlcmd(&case.cmd, file);
                 
-                // Extension Feature 11: The invariant must hold after the body
-                // This includes when break is executed (broke = true) or when continuing normally
+                let body_encoded = cmd_to_ivlcmd_with_post(&case.cmd, file, postcondition, current_method);
                 let mut assert_inv_after = IVLCmd::assert(&inv, "Loop invariant may not be preserved");
                 // Set span to first user-provided invariant if available
                 if let Some(first_inv) = invariants.first() {
@@ -551,7 +615,7 @@ fn cmd_to_ivlcmd_with_post(cmd: &Cmd, file: &slang::SourceFile, postcondition: &
                 // Guard: i < end (continue looping)
                 let guard = loop_var.clone().lt(end);
                 let one = Expr::new_typed(slang::ast::ExprKind::Num(1), ty.clone());
-                let body_encoded = cmd_to_ivlcmd(&body.cmd, file);
+                let body_encoded = cmd_to_ivlcmd(&body.cmd, file, current_method);
                 let increment = IVLCmd::assign(name, &(loop_var.clone() + one));
                 let loop_body_with_increment = IVLCmd::seq(&body_encoded, &increment);
                 
@@ -632,7 +696,7 @@ fn cmd_to_ivlcmd_with_post(cmd: &Cmd, file: &slang::SourceFile, postcondition: &
                 let assign_i = IVLCmd::assign(name, &i_expr);
                 
                 // Execute body
-                let body_encoded = cmd_to_ivlcmd(&body.cmd, file);
+                let body_encoded = cmd_to_ivlcmd(&body.cmd, file, current_method);
                 
                 // Sequence: name := i; body
                 let iteration = IVLCmd::seq(&assign_i, &body_encoded);
@@ -675,7 +739,7 @@ fn cmd_to_ivlcmd_with_post(cmd: &Cmd, file: &slang::SourceFile, postcondition: &
             // Build precondition checks
             // Substitute formal parameters with actual arguments
             let mut precond_cmd = IVLCmd::nop();
-            
+
             for pre_cond in called_method.requires() {
                 let mut substituted_pre = pre_cond.clone();
                 
@@ -690,6 +754,32 @@ fn cmd_to_ivlcmd_with_post(cmd: &Cmd, file: &slang::SourceFile, postcondition: &
                 assert_pre.span = fun_name.span;
                 precond_cmd = IVLCmd::seq(&precond_cmd, &assert_pre);
             }
+
+            if let Some(curr) = current_method {
+                if curr.name.ident == called_method.name.ident {
+                    if let Some(callee_v) = &called_method.variant {
+                        // must match the name created earlier in `analyze`
+                        let ghost_name = format!("__methV_{}", curr.name.ident);
+                        let ghost_e    = Expr::ident(&ghost_name, &Type::Int);
+
+                        // substitute formals -> actuals in the callee's variant
+                        let mut v_call = callee_v.clone();
+                        for (param, arg) in called_method.args.iter().zip(args.iter()) {
+                            v_call = v_call.subst_ident(&param.name.ident, arg);
+                        }
+
+                        // require strict decrease
+                        let mut assert_dec = IVLCmd::assert(
+                            &v_call.lt(&ghost_e),
+                            "Recursive call does not decrease the method’s variant",
+                        );
+                        assert_dec.span = fun_name.span; // point at the call site
+                        precond_cmd = IVLCmd::seq(&precond_cmd, &assert_dec);
+                    }
+                }
+            }
+            
+            
             
             // Extension Feature 9: Save old values of modified global variables
             // For each global in modifies clause, create __old_<name> := <name>
@@ -841,6 +931,14 @@ fn wp(ivl: &IVLCmd, post: &Expr) -> (Expr, String, Span) {
         },
         IVLCmdKind::Assume { condition } => {
             (!condition.clone() | post.clone(), String::new(), Span::default())
+        },
+        IVLCmdKind::Assignment { name, expr } => {
+            (post.clone().subst_ident(&name.ident, expr), String::new(), Span::default())
+        },
+        IVLCmdKind::Havoc { name, ty } => {
+            let fresh = format!("{}_{}", name.ident, next_fresh_id());
+            let fresh_e = Expr::ident(&fresh, ty);
+            (post.subst_ident(&name.ident, &fresh_e), String::new(), Span::default())
         },
         IVLCmdKind::NonDet(cmd1, cmd2) => {
             let (expr1, msg1, span1) = wp(&cmd1, post);
