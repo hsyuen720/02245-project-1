@@ -35,6 +35,38 @@ impl slang_ui::Hook for App {
 
         // Iterate methods
         for m in file.methods() {
+            // Extension Feature 9: For methods that modify global variables,
+            // we need to save the old values at method entry
+            let modifies_globals: Vec<String> = m.modifies()
+                .map(|(name, _ty)| name.ident.clone())
+                .collect();
+            
+            let globals = file.globals();
+            
+            // Save old values of global variables that this method modifies
+            let mut save_old_globals_cmd = IVLCmd::nop();
+            for global_name in &modifies_globals {
+                let global_var = globals.iter()
+                    .find(|g| g.var.name.ident == *global_name)
+                    .expect("Global variable not found");
+                
+                let old_name = slang::ast::Name {
+                    ident: format!("__old_{}", global_name),
+                    span: m.name.span,
+                };
+                let current_value = Expr::ident(global_name, &global_var.var.ty.1);
+                save_old_globals_cmd = IVLCmd::seq(&save_old_globals_cmd, &IVLCmd::assign(&old_name, &current_value));
+                
+                // Create assumption connecting old(global_name) to __old_global_name
+                let old_global_expr = Expr::new_typed(
+                    slang::ast::ExprKind::Old(global_var.var.name.clone()),
+                    global_var.var.ty.1.clone()
+                );
+                let saved_value_expr = Expr::ident(&format!("__old_{}", global_name), &global_var.var.ty.1);
+                let connection = old_global_expr.eq(&saved_value_expr);
+                save_old_globals_cmd = IVLCmd::seq(&save_old_globals_cmd, &IVLCmd::assume(&connection));
+            }
+            
             // Get method's preconditions;
             let pres = m.requires();
             // Merge them into a single condition
@@ -47,8 +79,12 @@ impl slang_ui::Hook for App {
 
             // Get method's body
             let cmd = &m.body.clone().unwrap().cmd;
-            // Encode it in IVL
-            let ivl = cmd_to_ivlcmd(cmd, file);
+            
+            // Encode method body
+            let ivl_body = cmd_to_ivlcmd(cmd, file);
+            
+            // Prepend the save_old_globals command to the body
+            let ivl = IVLCmd::seq(&save_old_globals_cmd, &ivl_body);
 
             let post0 = m
                 .ensures()
@@ -393,7 +429,9 @@ fn cmd_to_ivlcmd(cmd: &Cmd, file: &slang::SourceFile) -> IVLCmd {
             // Handle method calls by:
             // 1. Assert preconditions hold (with arguments substituted)
             // 2. Havoc return variable (if any)
-            // 3. Assume postconditions hold (with arguments and result substituted)
+            // 3. Extension Feature 9: Save old values of global variables in modifies clause
+            // 4. Extension Feature 9: Havoc global variables in modifies clause
+            // 5. Assume postconditions hold (with arguments, result, and old() substituted)
             
             // Find the called method in the source file
             let methods = file.methods();
@@ -404,6 +442,14 @@ fn cmd_to_ivlcmd(cmd: &Cmd, file: &slang::SourceFile) -> IVLCmd {
             
             // Get parameters from the called method
             let params: Vec<_> = called_method.args.iter().collect();
+            
+            // Extension Feature 9: Get global variables that the called method can modify
+            let modifies_globals: Vec<String> = called_method.modifies()
+                .map(|(name, _ty)| name.ident.clone())
+                .collect();
+            
+            // Get all global variables from the file
+            let globals = file.globals();
             
             // Build precondition checks
             // Substitute formal parameters with actual arguments
@@ -422,6 +468,43 @@ fn cmd_to_ivlcmd(cmd: &Cmd, file: &slang::SourceFile) -> IVLCmd {
                 let mut assert_pre = IVLCmd::assert(&substituted_pre, "Method precondition might not hold");
                 assert_pre.span = fun_name.span;
                 precond_cmd = IVLCmd::seq(&precond_cmd, &assert_pre);
+            }
+            
+            // Extension Feature 9: Save old values of modified global variables
+            // For each global in modifies clause, create __old_<name> := <name>
+            let mut save_old_globals = IVLCmd::nop();
+            for global_name in &modifies_globals {
+                // Find the global variable's type
+                let global_var = globals.iter()
+                    .find(|g| g.var.name.ident == *global_name)
+                    .expect("Global variable not found");
+                
+                let old_name = slang::ast::Name {
+                    ident: format!("__old_{}", global_name),
+                    span: fun_name.span,
+                };
+                let current_value = Expr::ident(global_name, &global_var.var.ty.1);
+                save_old_globals = IVLCmd::seq(&save_old_globals, &IVLCmd::assign(&old_name, &current_value));
+                
+                // Also create an assumption that connects old(global_name) with __old_global_name
+                // This helps the SMT solver understand the relationship
+                let old_global_expr = Expr::new_typed(
+                    slang::ast::ExprKind::Old(global_var.var.name.clone()),
+                    global_var.var.ty.1.clone()
+                );
+                let saved_value_expr = Expr::ident(&format!("__old_{}", global_name), &global_var.var.ty.1);
+                let connection = old_global_expr.eq(&saved_value_expr);
+                save_old_globals = IVLCmd::seq(&save_old_globals, &IVLCmd::assume(&connection));
+            }
+            
+            // Extension Feature 9: Havoc modified global variables
+            let mut havoc_globals = IVLCmd::nop();
+            for global_name in &modifies_globals {
+                let global_var = globals.iter()
+                    .find(|g| g.var.name.ident == *global_name)
+                    .expect("Global variable not found");
+                
+                havoc_globals = IVLCmd::seq(&havoc_globals, &IVLCmd::havoc(&global_var.var.name, &global_var.var.ty.1));
             }
             
             // Handle return value if present
@@ -452,6 +535,9 @@ fn cmd_to_ivlcmd(cmd: &Cmd, file: &slang::SourceFile) -> IVLCmd {
                     let ret_expr = Expr::ident(&ret_name.ident, &ret_ty);
                     substituted_post = substituted_post.subst_result(&ret_expr);
                     
+                    // Note: old() expressions should now work correctly because we added
+                    // an assumption that old(global) == __old_global after saving the value
+                    
                     // Assume the postcondition holds
                     let assume_post = IVLCmd::assume(&substituted_post);
                     postcond_cmd = IVLCmd::seq(&postcond_cmd, &assume_post);
@@ -470,6 +556,9 @@ fn cmd_to_ivlcmd(cmd: &Cmd, file: &slang::SourceFile) -> IVLCmd {
                         substituted_post = substituted_post.subst_ident(&param.name.ident, arg);
                     }
                     
+                    // Note: old() expressions should now work correctly because we added
+                    // an assumption that old(global) == __old_global after saving the value
+                    
                     // Assume the postcondition holds
                     let assume_post = IVLCmd::assume(&substituted_post);
                     postcond_cmd = IVLCmd::seq(&postcond_cmd, &assume_post);
@@ -478,8 +567,8 @@ fn cmd_to_ivlcmd(cmd: &Cmd, file: &slang::SourceFile) -> IVLCmd {
                 postcond_cmd
             };
             
-            // Sequence: assert preconditions, then havoc+assume postconditions
-            IVLCmd::seq(&precond_cmd, &ret_cmd)
+            // Sequence: assert preconditions, save old globals, havoc globals, then havoc+assume postconditions
+            IVLCmd::seq(&precond_cmd, &IVLCmd::seq(&save_old_globals, &IVLCmd::seq(&havoc_globals, &ret_cmd)))
         },
         _ => {
             eprintln!("Unsupported command kind: {:?}", cmd.kind);
