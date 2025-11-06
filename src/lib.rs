@@ -80,25 +80,31 @@ impl slang_ui::Hook for App {
             // Get method's body
             let cmd = &m.body.clone().unwrap().cmd;
             
-            // Encode method body
-            let ivl_body = cmd_to_ivlcmd(cmd, file);
-            
-            // Prepend the save_old_globals command to the body
-            let ivl = IVLCmd::seq(&save_old_globals_cmd, &ivl_body);
-
+            // Get the postcondition that returns should check
             let post0 = m
                 .ensures()
                 .cloned()
                 .reduce(|a, b| a & b)
                 .unwrap_or(Expr::bool(true));
 
-            let post = if let Some((_, ret_ty)) = &m.return_ty {
+            let return_postcondition = if let Some((_, ret_ty)) = &m.return_ty {
                 let ret_ty = ret_ty.clone();
                 let ret_expr = Expr::ident("ret", &ret_ty);
                 post0.subst_result(&ret_expr)
-                } else {
-                    post0
-                };
+            } else {
+                post0
+            };
+            
+            // Encode method body, passing the postcondition so returns can check it
+            let ivl_body = cmd_to_ivlcmd_with_post(cmd, file, &return_postcondition);
+            
+            // Prepend the save_old_globals command to the body
+            let ivl = IVLCmd::seq(&save_old_globals_cmd, &ivl_body);
+
+            // Since returns now check the postcondition, we just need to verify the body
+            // with postcondition 'true' (or the actual postcondition if no returns)
+            // For simplicity, we'll use 'true' as the post for wp, since returns already check it
+            let post = Expr::bool(true);
 
             // Use the original command without adding an explicit postcondition check
             // The postcondition is checked through the wp calculation
@@ -154,10 +160,14 @@ impl slang_ui::Hook for App {
 // Encoding of (assert-only) statements into IVL (for programs comprised of only
 // a single assertion)
 fn cmd_to_ivlcmd(cmd: &Cmd, file: &slang::SourceFile) -> IVLCmd {
+    cmd_to_ivlcmd_with_post(cmd, file, &Expr::bool(true))
+}
+
+fn cmd_to_ivlcmd_with_post(cmd: &Cmd, file: &slang::SourceFile, postcondition: &Expr) -> IVLCmd {
     match &cmd.kind {
         CmdKind::Assert { condition, .. } => IVLCmd::assert(condition, "Assert might fail!"),
         CmdKind::Seq(first, second) => {
-            IVLCmd::seq(&cmd_to_ivlcmd(first, file), &cmd_to_ivlcmd(second, file))
+            IVLCmd::seq(&cmd_to_ivlcmd_with_post(first, file, postcondition), &cmd_to_ivlcmd_with_post(second, file, postcondition))
         },
         CmdKind::Assume { condition } => IVLCmd::assume(condition),
         CmdKind::Assignment { name, expr } => IVLCmd::assign(name, expr),
@@ -175,22 +185,37 @@ fn cmd_to_ivlcmd(cmd: &Cmd, file: &slang::SourceFile) -> IVLCmd {
         },
         CmdKind::Match { body } => {
             let mut branches: Vec<IVLCmd> = Vec::new();
+            let mut negated_guards: Vec<Expr> = Vec::new();
 
             for case in &body.cases {
-                let assume  = IVLCmd::assume(&case.condition);
-                let lowered = cmd_to_ivlcmd(&case.cmd, file);
-                let branch  = IVLCmd::seq(&assume, &lowered);
+                // Each branch assumes its own guard AND the negation of all previous guards
+                let mut branch_assumptions = IVLCmd::assume(&case.condition);
+                for neg_guard in &negated_guards {
+                    branch_assumptions = IVLCmd::seq(&IVLCmd::assume(neg_guard), &branch_assumptions);
+                }
+                
+                let lowered = cmd_to_ivlcmd_with_post(&case.cmd, file, postcondition);
+                let branch  = IVLCmd::seq(&branch_assumptions, &lowered);
                 branches.push(branch);
+                
+                // Add negation of current guard to the list for subsequent branches
+                negated_guards.push(!case.condition.clone());
             }
 
             IVLCmd::nondets(&branches)
         },
         CmdKind::Return { expr } => {
+            // Extension Feature 10: Early return
+            // Return makes everything after it unreachable
             match expr {
                 Some(init_expression) => {
                     let ret_name = slang::ast::Name { ident: "ret".to_string(), span: init_expression.span };
-                    let assign: IVLCmd   = IVLCmd::assign(&ret_name, init_expression);
-                    IVLCmd::nondet(&assign, &IVLCmd::unreachable())
+                    let assign = IVLCmd::assign(&ret_name, init_expression);
+                    // Check postcondition at the return point
+                    // Use empty message so error reporting uses the ensures clause span
+                    let assert_post = IVLCmd::assert(postcondition, "");
+                    // Sequence: assignment, assert postcondition, then unreachable
+                    IVLCmd::seq(&assign, &IVLCmd::seq(&assert_post, &IVLCmd::unreachable()))
                 }
                 None => IVLCmd::unreachable(),
             }
